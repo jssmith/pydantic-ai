@@ -69,6 +69,7 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         toolset_activity_config: dict[str, ActivityConfig] | None = None,
         tool_activity_config: dict[str, dict[str, ActivityConfig | Literal[False]]] | None = None,
         run_context_type: type[TemporalRunContext[AgentDepsT]] = TemporalRunContext[AgentDepsT],
+        enable_pubsub_streaming: bool = False,
         temporalize_toolset_func: Callable[
             [
                 AbstractToolset[AgentDepsT],
@@ -118,6 +119,7 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
 
         self._name = name
         self._event_stream_handler = event_stream_handler
+        self._enable_pubsub_streaming = enable_pubsub_streaming
         self.run_context_type = run_context_type
 
         if self.name is None:
@@ -179,6 +181,7 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             models=models,
             provider_factory=provider_factory,
             agent=self.wrapped,
+            enable_pubsub_streaming=enable_pubsub_streaming,
         )
         activities.extend(temporal_model.temporal_activities)
         self._temporal_model = temporal_model
@@ -234,12 +237,23 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
     @property
     def event_stream_handler(self) -> EventStreamHandler[AgentDepsT] | None:
         handler = self._event_stream_handler or super().event_stream_handler
-        if handler is None:
+        if handler is None and not self._enable_pubsub_streaming:
             return None
+        elif handler is None and self._enable_pubsub_streaming:
+            # When pubsub streaming is enabled without an explicit handler,
+            # return a no-op handler so the agent framework takes the streaming
+            # code path. The actual publishing happens inside request_stream_activity.
+            return self._noop_event_stream_handler
         elif workflow.in_workflow():
             return self._call_event_stream_handler_activity
         else:
             return handler
+
+    @staticmethod
+    async def _noop_event_stream_handler(
+        _ctx: RunContext[Any], _stream: AsyncIterable[_messages.AgentStreamEvent]
+    ) -> None:
+        pass
 
     async def _call_event_stream_handler_activity(
         self, ctx: RunContext[AgentDepsT], stream: AsyncIterable[_messages.AgentStreamEvent]

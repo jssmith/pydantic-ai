@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import functools
+import json
+import logging
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ConfigDict, with_config
@@ -15,14 +18,25 @@ from pydantic_ai import ModelMessage, ModelResponse, models
 from pydantic_ai._run_context import get_current_run_context
 from pydantic_ai.agent import EventStreamHandler
 from pydantic_ai.exceptions import UserError
+from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, TextPartDelta, ToolCallPartDelta
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse, infer_model_profile, parse_model_id
 from pydantic_ai.models.wrapper import CompletedStreamedResponse, WrapperModel
 from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.providers import Provider
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.tools import AgentDepsT, RunContext
+from pydantic_ai.tools import AgentDepsT, RunContext, ToolCallPart
 
 from ._run_context import TemporalRunContext, deserialize_run_context
+
+logger = logging.getLogger(__name__)
+
+EVENTS_TOPIC = 'events'
+
+
+def _make_event(event_type: str, **data: object) -> bytes:
+    return json.dumps(
+        {'type': event_type, 'timestamp': datetime.now(timezone.utc).isoformat(), 'data': data}
+    ).encode()
 
 if TYPE_CHECKING:
     from pydantic_ai.agent.abstract import AbstractAgent
@@ -55,6 +69,7 @@ class TemporalModel(WrapperModel):
         models: Mapping[str, Model] | None = None,
         provider_factory: TemporalProviderFactory | None = None,
         agent: AbstractAgent[Any, Any] | None = None,
+        enable_pubsub_streaming: bool = False,
     ):
         # Build models_by_id registry from wrapped model and models parameter
         self._models_by_id: dict[str, Model] = {}
@@ -80,6 +95,7 @@ class TemporalModel(WrapperModel):
         self._model_id_var: ContextVar[str | None] = ContextVar('_temporal_model_id', default=None)
         self._provider_factory = provider_factory
         self._agent = agent
+        self._enable_pubsub_streaming = enable_pubsub_streaming
 
         @activity.defn(name=f'{activity_name_prefix}__model_request')
         async def request_activity(params: _RequestParams, deps: Any | None = None) -> ModelResponse:
@@ -98,8 +114,9 @@ class TemporalModel(WrapperModel):
         self.request_activity.__annotations__['deps'] = deps_type | None
 
         async def request_stream_activity(params: _RequestParams, deps: AgentDepsT) -> ModelResponse:
-            # An error is raised in `request_stream` if no `event_stream_handler` is set.
-            assert self.event_stream_handler is not None
+            # An error is raised in `request_stream` if no `event_stream_handler` is set
+            # (unless pubsub streaming is enabled, which provides its own streaming path).
+            assert self.event_stream_handler is not None or self._enable_pubsub_streaming
             run_context = deserialize_run_context(
                 self.run_context_type, params.serialized_run_context, deps=deps, agent=self._agent
             )
@@ -110,10 +127,15 @@ class TemporalModel(WrapperModel):
                 params.model_request_parameters,
                 run_context,
             ) as streamed_response:
-                await self.event_stream_handler(run_context, streamed_response)
-
-                async for _ in streamed_response:
-                    pass
+                if self._enable_pubsub_streaming:
+                    await self._publish_stream_via_pubsub(streamed_response)
+                elif self.event_stream_handler is not None:
+                    await self.event_stream_handler(run_context, streamed_response)
+                    async for _ in streamed_response:
+                        pass
+                else:
+                    async for _ in streamed_response:
+                        pass
             return streamed_response.get()
 
         # Set type hint explicitly so that Temporal can take care of serialization and deserialization
@@ -127,6 +149,50 @@ class TemporalModel(WrapperModel):
     @property
     def temporal_activities(self) -> list[Callable[..., Any]]:
         return [self.request_activity, self.request_stream_activity]
+
+    async def _publish_stream_via_pubsub(self, streamed_response: StreamedResponse) -> None:
+        """Consume a streamed response, publishing token events via PubSubClient.
+
+        This runs inside the ``request_stream_activity`` when
+        ``enable_pubsub_streaming`` is True. It creates a single PubSubClient
+        for the entire stream, publishes batched events, and heartbeats on each
+        chunk.
+        """
+        from temporalio.contrib.pubsub import PubSubClient
+
+        pubsub = PubSubClient.create(batch_interval=0.1)
+        text_buffer = ''
+
+        async with pubsub:
+            pubsub.publish(EVENTS_TOPIC, _make_event('LLM_CALL_START'), priority=True)
+
+            async for event in streamed_response:
+                activity.heartbeat()
+
+                if isinstance(event, PartDeltaEvent):
+                    if isinstance(event.delta, TextPartDelta):
+                        text_buffer += event.delta.content_delta
+                        pubsub.publish(
+                            EVENTS_TOPIC,
+                            _make_event('TEXT_DELTA', delta=event.delta.content_delta),
+                        )
+                    elif isinstance(event.delta, ToolCallPartDelta) and event.delta.args_delta:
+                        pubsub.publish(
+                            EVENTS_TOPIC,
+                            _make_event('TOOL_INPUT_DELTA', delta=event.delta.args_delta),
+                        )
+                elif isinstance(event, PartStartEvent):
+                    if isinstance(event.part, ToolCallPart):
+                        pubsub.publish(
+                            EVENTS_TOPIC,
+                            _make_event('TOOL_CALL_START', tool_name=event.part.tool_name),
+                        )
+
+            if text_buffer:
+                pubsub.publish(
+                    EVENTS_TOPIC, _make_event('TEXT_COMPLETE', text=text_buffer), priority=True
+                )
+            pubsub.publish(EVENTS_TOPIC, _make_event('LLM_CALL_COMPLETE'), priority=True)
 
     async def request(
         self,
@@ -185,9 +251,11 @@ class TemporalModel(WrapperModel):
                 'A Temporal model cannot be used with `pydantic_ai.direct.model_request_stream()` as it requires a `run_context`. Set an `event_stream_handler` on the agent and use `agent.run()` instead.'
             )
 
-        # We can never get here without an `event_stream_handler`, as `TemporalAgent.run_stream` and `TemporalAgent.iter` raise an error saying to use `TemporalAgent.run` instead,
-        # and that only calls `request_stream` if `event_stream_handler` is set.
-        assert self.event_stream_handler is not None
+        # We can never get here without an `event_stream_handler` or pubsub streaming,
+        # as `TemporalAgent.run_stream` and `TemporalAgent.iter` raise an error saying
+        # to use `TemporalAgent.run` instead, and that only calls `request_stream` if
+        # `event_stream_handler` is set or `enable_pubsub_streaming` is True.
+        assert self.event_stream_handler is not None or self._enable_pubsub_streaming
 
         self._validate_model_request_parameters(model_request_parameters)
 
