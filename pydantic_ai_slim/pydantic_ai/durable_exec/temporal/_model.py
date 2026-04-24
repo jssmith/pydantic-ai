@@ -18,7 +18,14 @@ from pydantic_ai import ModelMessage, ModelResponse, models
 from pydantic_ai._run_context import get_current_run_context
 from pydantic_ai.agent import EventStreamHandler
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import PartDeltaEvent, PartStartEvent, TextPartDelta, ToolCallPartDelta
+from pydantic_ai.messages import (
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    TextPart,
+    TextPartDelta,
+    ToolCallPartDelta,
+)
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse, infer_model_profile, parse_model_id
 from pydantic_ai.models.wrapper import CompletedStreamedResponse, WrapperModel
 from pydantic_ai.profiles import ModelProfile
@@ -160,18 +167,16 @@ class TemporalModel(WrapperModel):
         """
         from temporalio.contrib.pubsub import PubSubClient
 
-        pubsub = PubSubClient.create(batch_interval=0.1)
-        text_buffer = ''
+        pubsub = PubSubClient.from_activity(batch_interval=0.1)
 
         async with pubsub:
-            pubsub.publish(EVENTS_TOPIC, _make_event('LLM_CALL_START'), priority=True)
+            pubsub.publish(EVENTS_TOPIC, _make_event('LLM_CALL_START'), force_flush=True)
 
             async for event in streamed_response:
                 activity.heartbeat()
 
                 if isinstance(event, PartDeltaEvent):
                     if isinstance(event.delta, TextPartDelta):
-                        text_buffer += event.delta.content_delta
                         pubsub.publish(
                             EVENTS_TOPIC,
                             _make_event('TEXT_DELTA', delta=event.delta.content_delta),
@@ -187,12 +192,14 @@ class TemporalModel(WrapperModel):
                             EVENTS_TOPIC,
                             _make_event('TOOL_CALL_START', tool_name=event.part.tool_name),
                         )
+                elif isinstance(event, PartEndEvent) and isinstance(event.part, TextPart):
+                    pubsub.publish(
+                        EVENTS_TOPIC,
+                        _make_event('TEXT_COMPLETE', text=event.part.content),
+                        force_flush=True,
+                    )
 
-            if text_buffer:
-                pubsub.publish(
-                    EVENTS_TOPIC, _make_event('TEXT_COMPLETE', text=text_buffer), priority=True
-                )
-            pubsub.publish(EVENTS_TOPIC, _make_event('LLM_CALL_COMPLETE'), priority=True)
+            pubsub.publish(EVENTS_TOPIC, _make_event('LLM_CALL_COMPLETE'), force_flush=True)
 
     async def request(
         self,
