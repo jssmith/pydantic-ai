@@ -112,16 +112,17 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
             run_context_type: The `TemporalRunContext` subclass to use to serialize and deserialize the run context for use inside a Temporal activity.
                 By default, only the `deps`, `run_id`, `metadata`, `retries`, `tool_call_id`, `tool_name`, `tool_call_approved`, `retry`, `max_retries`, `run_step`, `usage`, and `partial_output` attributes will be available.
                 To make another attribute available, create a `TemporalRunContext` subclass with a custom `serialize_run_context` class method that returns a dictionary that includes the attribute.
-            streaming_event_topic: Pub/sub topic to publish raw model stream events
+            streaming_event_topic: Workflow Streams topic to publish raw model stream events
                 (`ModelResponseStreamEvent`) to during streamed runs. When set, the agent
                 always takes the streaming code path and the workflow must host a
-                `temporalio.contrib.pubsub.PubSub` broker to receive the publishes;
+                `temporalio.contrib.workflow_stream.WorkflowStream` to receive the publishes;
                 otherwise the signals are unhandled and dropped. Set to `None` (the default)
                 to publish nothing — streamed runs then require an `event_stream_handler`.
                 Streaming support is experimental and may change in future versions.
-            streaming_event_batch_interval: Interval between automatic flushes for the pub/sub
-                publisher used by the streaming activity. Ignored when `streaming_event_topic`
-                is `None`. Streaming support is experimental and may change in future versions.
+            streaming_event_batch_interval: Interval between automatic flushes for the
+                Workflow Streams publisher used by the streaming activity. Ignored when
+                `streaming_event_topic` is `None`. Streaming support is experimental and
+                may change in future versions.
             temporalize_toolset_func: Optional function to use to prepare "leaf" toolsets (i.e. those that implement their own tool listing and calling) for Temporal by wrapping them in a `TemporalWrapperToolset` that moves methods that require IO to Temporal activities.
                 If not provided, only `FunctionToolset` and `MCPServer` will be prepared for Temporal.
                 The function takes the toolset, the activity name prefix, the toolset-specific activity config, the tool-specific activity configs and the run context type.
@@ -252,7 +253,7 @@ class TemporalAgent(WrapperAgent[AgentDepsT, OutputDataT]):
         if handler is None and self._streaming_event_topic is None:
             return None
         elif handler is None and self._streaming_event_topic is not None:
-            # When pub/sub streaming is enabled without an explicit handler,
+            # When workflow-stream publishing is enabled without an explicit handler,
             # return a no-op handler so the agent framework takes the streaming
             # code path. The actual publishing happens inside request_stream_activity.
             return self._noop_event_stream_handler

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import functools
-import logging
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -25,8 +24,6 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import AgentDepsT, RunContext
 
 from ._run_context import TemporalRunContext, deserialize_run_context
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pydantic_ai.agent.abstract import AbstractAgent
@@ -107,7 +104,7 @@ class TemporalModel(WrapperModel):
 
         async def request_stream_activity(params: _RequestParams, deps: AgentDepsT) -> ModelResponse:
             # An error is raised in `request_stream` if no `event_stream_handler` is set
-            # (unless pub/sub streaming is enabled, which provides its own streaming path).
+            # (unless workflow-stream publishing is enabled, which provides its own streaming path).
             assert self.event_stream_handler is not None or self._streaming_event_topic is not None
             run_context = deserialize_run_context(
                 self.run_context_type, params.serialized_run_context, deps=deps, agent=self._agent
@@ -143,28 +140,28 @@ class TemporalModel(WrapperModel):
         return [self.request_activity, self.request_stream_activity]
 
     async def _publish_stream(self, streamed_response: StreamedResponse) -> None:
-        """Consume a streamed response, publishing each raw event via PubSubClient.
+        """Consume a streamed response, publishing each raw event via WorkflowStreamClient.
 
         Runs inside ``request_stream_activity`` when ``streaming_event_topic``
-        is set. Creates a single :class:`PubSubClient` for the stream and
-        publishes each ``ModelResponseStreamEvent`` to the configured topic so
-        external consumers (UIs, tracing, etc.) can observe events as they
-        arrive.
+        is set. Creates a single :class:`WorkflowStreamClient` for the stream
+        and publishes each ``ModelResponseStreamEvent`` to the configured
+        topic so external consumers (UIs, tracing, etc.) can observe events
+        as they arrive.
 
         .. warning::
             Streaming support is experimental and may change in future
             versions.
         """
-        from temporalio.contrib.pubsub import PubSubClient
+        from temporalio.contrib.workflow_stream import WorkflowStreamClient
 
         assert self._streaming_event_topic is not None
         topic = self._streaming_event_topic
-        pubsub = PubSubClient.from_activity(batch_interval=self._streaming_event_batch_interval)
+        stream = WorkflowStreamClient.from_activity(batch_interval=self._streaming_event_batch_interval)
 
-        async with pubsub:
+        async with stream:
             async for event in streamed_response:
                 activity.heartbeat()
-                pubsub.publish(topic, event)
+                stream.publish(topic, event)
 
     async def request(
         self,
@@ -223,7 +220,7 @@ class TemporalModel(WrapperModel):
                 'A Temporal model cannot be used with `pydantic_ai.direct.model_request_stream()` as it requires a `run_context`. Set an `event_stream_handler` on the agent and use `agent.run()` instead.'
             )
 
-        # We can never get here without an `event_stream_handler` or pub/sub streaming,
+        # We can never get here without an `event_stream_handler` or workflow-stream publishing,
         # as `TemporalAgent.run_stream` and `TemporalAgent.iter` raise an error saying
         # to use `TemporalAgent.run` instead, and that only calls `request_stream` if
         # `event_stream_handler` is set or `streaming_event_topic` is configured.
